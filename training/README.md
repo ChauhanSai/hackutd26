@@ -36,7 +36,7 @@ This directory contains the complete Python training pipeline for **Benoit**, an
 ## Quickstart
 
 ```bash
-cd "/Users/saichauhan/Desktop/HackUTD '26/training"
+cd "scrabblebot/training"
 
 # Setup virtual environment
 source .venv/bin/activate

@@ -13,3 +13,5 @@ bot-starter/src/module_bindings/
 
 .venv
 __pycache__
+training/checkpoints
+training/test_checkpoints

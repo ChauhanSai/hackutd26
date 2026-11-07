@@ -174,8 +174,8 @@ def sample_opponents_for_match(snapshot_pool: SnapshotPool, num_needed: int = 5)
     ]
     opponents: List[BaseOpponent] = []
     for _ in range(num_needed):
-        # 50% chance to pick snapshot if available, 50% rule-based
-        if snapshot_pool.snapshots and random.random() < 0.5:
+        # 20% chance to pick snapshot if available, 80% rule-based
+        if snapshot_pool.snapshots and random.random() < 0.2:
             opp = snapshot_pool.sample_opponent()
             if opp:
                 opponents.append(opp)
@@ -206,7 +206,7 @@ def train_benoit(
     print(f"Training Benoit on device: {device} | Encoder: {encoder_type}")
 
     shared_dict = EnableDictionary()
-    env = ScrabbleBotEnv(dictionary=shared_dict, reward_type="rank")
+    env = ScrabbleBotEnv(dictionary=shared_dict, reward_type="dense")
 
     model = BenoitActorCritic(encoder_type=encoder_type).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
@@ -216,13 +216,13 @@ def train_benoit(
 
     num_iterations = total_timesteps // steps_per_batch
     step_count = 0
-    episodes_completed = 0
-    wins_count = 0
     recent_rewards: List[float] = []
 
     start_time = time.time()
 
     for iteration in range(1, num_iterations + 1):
+        episodes_completed = 0
+        wins_count = 0
         buffer.clear()
         model.eval()
 

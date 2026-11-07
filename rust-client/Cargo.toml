@@ -6,7 +6,7 @@ description = "Benoit: High-Performance RL ScrabbleBot Client for SpacetimeDB"
 
 [dependencies]
 # SpacetimeDB SDK for real-time multiplayer table events and reducers
-spacetimedb-sdk = "0.14"
+spacetimedb-sdk = "2.14.1"
 
 # Pure-Rust ONNX execution engine (no external C++ libraries required)
 tract-onnx = "0.21"

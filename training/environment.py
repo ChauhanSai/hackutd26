@@ -61,8 +61,8 @@ class CheapskateOpponent(BaseOpponent):
         best_word_info: Tuple[Optional[str], int, int, int],
     ) -> Tuple[int, bool]:
         val = LETTER_VALUES.get(letter, 1)
-        jitter = random.randint(-2, 2)
-        bid = max(min(val - 1 + jitter, balance), 0)
+        jitter = random.randint(-1, 3)
+        bid = max(min(val + 3 + jitter, balance), 0)
         word, score, length, _ = best_word_info
         play = word is not None and length >= 3
         return bid, play
@@ -81,8 +81,12 @@ class ValueBidderOpponent(BaseOpponent):
         best_word_info: Tuple[Optional[str], int, int, int],
     ) -> Tuple[int, bool]:
         val = LETTER_VALUES.get(letter, 1)
-        jitter = random.randint(-2, 2)
-        bid = max(min(val + jitter, balance), 0)
+        # Matches live market: 8-15 bids on regular tiles, up to 20 on high tiles
+        base_bid = 8 + val
+        if balance < 30:
+            base_bid = max(4, val + 2)
+        jitter = random.randint(-2, 3)
+        bid = max(min(base_bid + jitter, balance), 0)
         word, score, length, _ = best_word_info
         play = word is not None and length >= 3
         return bid, play
@@ -102,9 +106,13 @@ class AggressiveOpponent(BaseOpponent):
     ) -> Tuple[int, bool]:
         val = LETTER_VALUES.get(letter, 1)
         is_vowel = letter in "AEIOU"
-        jitter = random.randint(-2, 2)
-        bonus = 4 if is_vowel else 2
-        bid = max(min(val + bonus + jitter, balance), 0)
+        # Bids 12-24 when rich, matching live aggressive bots
+        premium = 6 if is_vowel else 4
+        if letter in "JQZX":
+            premium += 8
+        base_bid = 10 + val + premium if balance >= 40 else max(5, val + 4)
+        jitter = random.randint(-2, 3)
+        bid = max(min(base_bid + jitter, balance), 0)
         word, score, length, _ = best_word_info
         play = word is not None and length >= 3
         return bid, play
@@ -126,11 +134,46 @@ class HoarderOpponent(BaseOpponent):
     ) -> Tuple[int, bool]:
         val = LETTER_VALUES.get(letter, 1)
         is_vowel = letter in "AEIOU"
-        premium = 3 if is_vowel else 1
-        bid = max(min(val + premium + random.randint(-1, 2), balance), 0)
+        premium = 5 if is_vowel else 3
+        if letter in "JQZXS":
+            premium += 7
+        base_bid = 9 + val + premium if balance >= 40 else max(4, val + 3)
+        bid = max(min(base_bid + random.randint(-2, 2), balance), 0)
         word, score, length, bonus = best_word_info
-        # Only plays if 5+ letters or significant bonus
-        play = word is not None and (length >= 5 or bonus >= 8)
+        # Plays if 5+ letters, bonus >= 6, or late game
+        play = word is not None and (length >= 5 or bonus >= 6)
+        return bid, play
+
+
+class MarketCompetitiveOpponent(BaseOpponent):
+    """Replicates live lobby opponents that bid 12-25 early and play 4-6 letter words."""
+
+    def __init__(self) -> None:
+        super().__init__("MarketCompetitive")
+
+    def act(
+        self,
+        player_idx: int,
+        letter: str,
+        balance: int,
+        rack: List[int],
+        best_word_info: Tuple[Optional[str], int, int, int],
+    ) -> Tuple[int, bool]:
+        val = LETTER_VALUES.get(letter, 1)
+        is_vowel = letter in "AEIOU"
+        is_high = letter in "JQZXSK"
+        
+        if balance >= 60:
+            target = 12 + val + (6 if is_high else (4 if is_vowel else 2))
+        elif balance >= 30:
+            target = 8 + val + (4 if is_high else 1)
+        else:
+            target = max(3, val + 1)
+            
+        jitter = random.randint(-2, 3)
+        bid = max(min(target + jitter, balance), 0)
+        word, score, length, bonus = best_word_info
+        play = word is not None and (length >= 4 or bonus >= 4 or balance < 25)
         return bid, play
 
 
@@ -213,11 +256,11 @@ class ScrabbleBotEnv(gym.Env):
 
     def _init_default_opponents(self) -> None:
         pool = [
-            CheapskateOpponent(),
-            ValueBidderOpponent(),
+            MarketCompetitiveOpponent(),
             AggressiveOpponent(),
-            HoarderOpponent(),
             ValueBidderOpponent(),
+            HoarderOpponent(),
+            MarketCompetitiveOpponent(),
         ]
         self.opponents = pool[: self.num_players - 1]
 
@@ -403,20 +446,27 @@ class ScrabbleBotEnv(gym.Env):
 
         # 3. Word Play Resolution
         # Agent 0 word play decision:
-        # Plays if agent0_play > 0.5 and a playable word exists
         word0, score0, len0, bonus0 = self.best_words[0]
         if word0 is not None:
-            # Play if threshold met (e.g. agent0_play > 0.5)
-            if agent0_play > 0.5:
-                # Execute word play
+            is_late_game = self.round_num > 45 or len(self.bag) < 20
+            is_low_balance = self.balances[0] < 25
+            should_play0 = (
+                agent0_play > 0.5 or
+                len0 >= 5 or
+                bonus0 >= 6 or
+                (is_late_game and len0 >= 3) or
+                (is_low_balance and len0 >= 3)
+            )
+            if should_play0:
                 self._play_word(0, word0, score0)
 
         # Opponent word plays
         for i, should_play in enumerate(opponent_plays):
             p_idx = i + 1
-            if should_play:
-                w, s, _, _ = self.best_words[p_idx]
-                if w is not None:
+            w, s, l, _ = self.best_words[p_idx]
+            if w is not None:
+                is_late_opp = self.round_num > 45 or len(self.bag) < 20
+                if should_play or (is_late_opp and l >= 3) or (self.balances[p_idx] < 20 and l >= 3):
                     self._play_word(p_idx, w, s)
 
         # 4. Check Match Termination
@@ -480,26 +530,28 @@ class ScrabbleBotEnv(gym.Env):
         """
         Terminal reward optimizing for 6-player win rate and relative placement.
         Sparse: 0 on all non-terminal steps.
+        Enforces severe penalty for 0 score to prevent unspent bankroll hoarding.
         """
         ranks = self._get_final_ranks()
         rank = ranks[player_idx]
+        my_score = int(self.scores[player_idx])
+
+        # Severe penalty for scoring 0 points
+        if my_score == 0:
+            return -1.5
 
         if self.reward_type == "win_loss":
             return 1.0 if rank == 1 else -1.0
 
         if self.reward_type == "score_margin":
-            my_score = float(self.scores[player_idx])
             opp_scores = [float(self.scores[i]) for i in range(self.num_players) if i != player_idx]
             mean_opp = sum(opp_scores) / len(opp_scores)
             return float(np.clip((my_score - mean_opp) / 50.0, -2.0, 2.0))
 
         # Default "rank": Smooth rank-based win-rate optimization in [-1.0, 1.0]
-        # Rank 1: +1.0
-        # Rank 2: +0.4
-        # Rank 3: +0.1
-        # Rank 4: -0.1
-        # Rank 5: -0.4
-        # Rank 6: -1.0
-        rank_rewards = {1: 1.0, 2: 0.4, 3: 0.1, 4: -0.1, 5: -0.4, 6: -1.0}
-        return rank_rewards.get(rank, -1.0)
+        # with score bonus to encourage aggressive point production
+        rank_rewards = {1: 1.0, 2: 0.5, 3: 0.2, 4: -0.1, 5: -0.4, 6: -0.8}
+        base_reward = rank_rewards.get(rank, -0.8)
+        score_bonus = min(0.5, my_score * 0.005)
+        return float(base_reward + score_bonus)
 

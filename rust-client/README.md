@@ -68,6 +68,7 @@ cargo build --release
 2. Launch Benoit:
 
 ```bash
+cd "scrabblebot/bot-starter"
 BOT_NAME=alice BOT_TOKEN=<token> npm start
 ```
 

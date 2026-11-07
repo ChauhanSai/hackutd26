@@ -1,16 +1,17 @@
-// Edit this file to implement your bidding and word-forming strategy.
+// Benoit ScrabbleBot Strategy
+// Integrates the trained ONNX Reinforcement Learning model with competitive market bidding
+// and superlinear word-forming heuristics.
 
-// Standard Scrabble letter values — useful for valuation.
+import { benoitModel, type ModelPrediction } from "./model_inference.js";
+
+// Standard Scrabble letter values
 export const LETTER_VALUE: Record<string, number> = {
   A: 1, B: 3, C: 3, D: 2, E: 1, F: 4, G: 2, H: 4, I: 1, J: 8,
   K: 5, L: 1, M: 3, N: 1, O: 1, P: 3, Q: 10, R: 1, S: 1, T: 1,
   U: 1, V: 4, W: 4, X: 8, Y: 4, Z: 10,
 };
 
-// Beniot Reflects the Reinforcement Learning and heuristic decision engine of the Rust/Python Benoit bot.
-// Combines superlinear word score maximization with Vickrey bidding budget management.
 // Length-based superlinear reward multiplier as (numerator, denominator)
-// Integer division matches SpacetimeDB game rules: totalReward = floor(baseScore * num / denom)
 export function lengthMultiplier(len: number): [number, number] {
   if (len <= 3) return [1, 1]; // 1.0x
   if (len === 4) return [3, 2]; // 1.5x
@@ -33,30 +34,65 @@ export interface BidContext {
   letter: string;              // Letter being auctioned, e.g. "Q"
   myBalance: number;           // Current spendable balance
   myRack: Map<string, number>; // Letters currently owned: letter -> count
+  roundNum?: number;
 }
 
 /**
- * Decide how much to bid for `letter` in the sealed-bid Vickrey auction.
- *
- * Reflects the Benoit policy:
- * - High-multiplier valuation: 8-10 pt tiles (Q, Z, X, J) scaled by expected 2x-3x bonus.
- * - Rack balance: tracks vowel/consonant ratio and penalizes duplicates (>= 2 of same letter).
- * - Synergy bonuses: boosts bids on critical pairs ('U' for 'Q', hook 'S', high-flexibility 'E', 'R', 'T').
- * - Bankroll management: scales ceiling dynamically relative to balance.
+ * Asynchronous bid decision executing the trained ONNX model.
+ */
+export async function decideBidAsync(ctx: BidContext): Promise<number> {
+  if (ctx.myBalance <= 0) return 0;
+
+  // 1. Try running inference on the trained ONNX model
+  try {
+    const pred = await benoitModel.predict({
+      letter: ctx.letter,
+      myBalance: ctx.myBalance,
+      myRack: ctx.myRack,
+      roundNum: ctx.roundNum,
+    });
+
+    if (pred) {
+      // Scale continuous bid fraction to available balance
+      // Bounded by sensible competitive limits
+      const modelBid = Math.round(pred.bidFraction * ctx.myBalance);
+      const cappedBid = Math.min(modelBid, ctx.myBalance);
+      if (cappedBid > 0) {
+        return cappedBid;
+      }
+    }
+  } catch (err) {
+    console.warn("[benoit] ONNX inference error in decideBidAsync:", err);
+  }
+
+  // 2. Fallback to calibrated competitive bidding strategy
+  return decideBid(ctx);
+}
+
+/**
+ * Synchronous bid decision matching competitive live-lobby Vickrey auction dynamics.
  */
 export function decideBid(ctx: BidContext): number {
   if (ctx.myBalance <= 0) return 0;
+
+  // If the model previously produced a prediction for this turn, utilize it
+  const pred = benoitModel.getLastPrediction();
+  if (pred && pred.bidFraction > 0.05) {
+    const modelBid = Math.round(pred.bidFraction * ctx.myBalance);
+    if (modelBid >= 1) {
+      return Math.min(modelBid, ctx.myBalance);
+    }
+  }
 
   const letter = ctx.letter.toUpperCase();
   const faceValue = LETTER_VALUE[letter] ?? 1;
   const have = ctx.myRack.get(letter) ?? 0;
 
-  // Severe penalty for duplicate letters (rack clutter)
+  // Severe penalty for duplicate letters (prevent rack clogging)
   if (have >= 2) {
-    return letter === "E" && ctx.myBalance > 50 ? 1 : 0;
+    return letter === "E" && ctx.myBalance > 60 ? 2 : 0;
   }
 
-  // Count vowels and total tiles currently in rack
   let vowels = 0;
   let consonants = 0;
   let totalTiles = 0;
@@ -72,66 +108,76 @@ export function decideBid(ctx: BidContext): number {
   const isVowel = "AEIOU".includes(letter);
   const vowelRatio = totalTiles > 0 ? vowels / totalTiles : 0.4;
 
-  let valuation = faceValue;
+  // Competitive market baseline:
+  // In live lobbies, bids are typically 10-22 on regular tiles and 18-35 on premium tiles.
+  // In Vickrey auctions you pay the 2nd highest bid, so a bid of 18 only costs ~12-14.
+  let marketBase = 10 + faceValue;
 
-  // 1. Rack balance adjustments
+  if (ctx.myBalance >= 80) {
+    marketBase = 12 + faceValue;
+  } else if (ctx.myBalance < 30) {
+    marketBase = Math.max(3, faceValue + 2);
+  }
+
+  // 1. Vowel/consonant balancing
   if (isVowel) {
     if (vowelRatio < 0.28) {
-      valuation += 3; // Vowel-starved: high premium
+      marketBase += 5; // Vowel starved: bid aggressively
     } else if (vowelRatio > 0.55) {
-      valuation = Math.max(1, valuation - 2); // Vowel-flooded: discount
+      marketBase = Math.max(2, marketBase - 4); // Flooded with vowels: discount
     }
   } else {
     if (vowelRatio > 0.65) {
-      valuation += 3; // Consonant-starved: premium
+      marketBase += 4; // Consonant starved: premium
     } else if (vowelRatio < 0.25) {
-      valuation = Math.max(1, valuation - 1); // Consonant-flooded: discount
+      marketBase = Math.max(2, marketBase - 3); // Flooded with consonants
     }
   }
 
   // 2. Unowned letter premium
   if (have === 0) {
-    valuation += 2;
+    marketBase += 3;
   }
 
-  // 3. Tile-specific synergies (matching Benoit's hoarding value)
+  // 3. Tile-specific synergies & high-value premiums
   switch (letter) {
     case "S":
-      valuation += 3; // The premier hook tile
+      marketBase += 6; // Crucial hook tile
       break;
     case "Q":
-      valuation += (ctx.myRack.get("U") ?? 0) > 0 ? 5 : 1; // High value if we hold 'U'
+      marketBase += (ctx.myRack.get("U") ?? 0) > 0 ? 10 : 3;
       break;
     case "U":
-      if ((ctx.myRack.get("Q") ?? 0) > 0) valuation += 4; // Crucial partner for 'Q'
+      if ((ctx.myRack.get("Q") ?? 0) > 0) marketBase += 8;
       break;
     case "Z":
     case "X":
     case "J":
-      // High-point letters yield massive superlinear rewards when matched with vowels
-      if (vowels >= 2) valuation += 4;
+      marketBase += vowels >= 2 ? 10 : 4;
+      break;
+    case "K":
+      marketBase += 4;
       break;
     case "E":
     case "R":
     case "T":
-    case "A":
     case "I":
     case "N":
-      valuation += 1; // Core anagram tiles
+    case "A":
+      marketBase += 2; // Premier anagram letters
       break;
   }
 
-  // 4. Budget & Vickrey scaling
-  // Prevent overbidding on any single letter while preserving bidding power for future rounds
-  let maxFraction = 0.35;
-  if (ctx.myBalance > 120) {
-    maxFraction = 0.45; // Aggressive when rich to starve opponents
-  } else if (ctx.myBalance < 30) {
-    maxFraction = 0.25; // Conservative when lean
+  // 4. Safe budget ceilings
+  let maxFraction = 0.40;
+  if (ctx.myBalance >= 100) {
+    maxFraction = 0.50; // Healthy bankroll: bid confidently to win letters
+  } else if (ctx.myBalance < 35) {
+    maxFraction = 0.30;
   }
 
-  const budgetCeiling = Math.max(1, Math.floor(ctx.myBalance * maxFraction));
-  const finalBid = Math.min(valuation, budgetCeiling, ctx.myBalance);
+  const ceiling = Math.max(1, Math.floor(ctx.myBalance * maxFraction));
+  const finalBid = Math.min(marketBase, ceiling, ctx.myBalance);
 
   return Math.max(0, finalBid);
 }
@@ -139,13 +185,11 @@ export function decideBid(ctx: BidContext): number {
 export interface WordContext {
   myRack: Map<string, number>;
   dictionary: string[]; // Sorted uppercase list, shared at startup
+  myBalance?: number;
 }
 
 /**
- * Evaluates whether to play a word from `myRack` or hold letters to build
- * high-bonus superlinear words (5+ letters for 2.0x - 3.0x bonus).
- *
- * Finds the highest-scoring valid word, then applies the Benoit hoarding threshold.
+ * Evaluates the best available word and decides whether to play or hold.
  */
 export function chooseWord(ctx: WordContext): string | null {
   let totalTiles = 0;
@@ -185,18 +229,27 @@ export function chooseWord(ctx: WordContext): string | null {
     return bestWord;
   }
 
-  // Real match play: apply Benoit's superlinear threshold
+  // Real match play: evaluate play threshold
   const { bonus } = calcWordScore(bestWord);
   const wordLen = bestWord.length;
+  const balance = ctx.myBalance ?? 100;
 
-  // Threshold conditions:
-  // 1. Long word achieving superlinear multipliers (5+ letters = 2.0x, 2.5x, 3.0x)
-  // 2. High bonus points earned (>= 6)
-  // 3. Rack capacity limit: rack is getting full (>= 8 tiles) -> flush to recycle tiles
+  // Threshold rules to prevent 0-word shutouts:
+  // 1. Long word achieving superlinear multipliers (>= 5 letters = 2.0x, 2.5x, 3.0x) -> ALWAYS PLAY
+  // 2. High bonus points earned (>= 5) -> PLAY
+  // 3. 4-letter word with decent base or bonus -> PLAY
+  // 4. Rack is getting full (>= 7 tiles) -> PLAY to clear space and recycle letters
+  // 5. Need currency (balance < 35) and have any word >= 3 letters -> PLAY to fund bids
+  const pred = benoitModel.getLastPrediction();
+  const nnTriggersPlay = pred !== null && pred.playThreshold > 0.5;
+
   const shouldPlay =
     wordLen >= 5 ||
-    bonus >= 6 ||
-    totalTiles >= 8;
+    bonus >= 5 ||
+    (wordLen === 4 && (bonus >= 2 || balance < 50 || totalTiles >= 6)) ||
+    totalTiles >= 7 ||
+    (balance < 35 && wordLen >= 3) ||
+    nnTriggersPlay;
 
   return shouldPlay ? bestWord : null;
 }

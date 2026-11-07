@@ -27,7 +27,8 @@ import {
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { chooseWord, decideBid } from "./strategy.js";
+import { chooseWord, decideBid, decideBidAsync } from "./strategy.js";
+import { benoitModel } from "./model_inference.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -113,7 +114,7 @@ function logFailure(what: string) {
     );
 }
 
-function tryBid(
+async function tryBid(
   conn: DbConnection,
   auctionId: bigint,
   matchId: bigint,
@@ -124,18 +125,24 @@ function tryBid(
   if (bidsByAuction.has(key)) return;
   const participant = participantForMatch(conn, matchId);
   if (!participant) return;
-  const amount = decideBid({
+  const rack = rackForMatch(conn, matchId);
+  const matchState = conn.db.matchState.id.find(matchId);
+  const roundNum = matchState?.currentRound ?? 1;
+
+  const amount = await decideBidAsync({
     letter,
     myBalance: participant.balance,
-    myRack: rackForMatch(conn, matchId),
+    myRack: rack,
+    roundNum,
   });
   if (amount <= 0) return;
   conn.reducers
     .submitBid({ auctionId, amount: BigInt(amount) })
     .catch(logFailure(`bid on auction ${auctionId}`));
   bidsByAuction.add(key);
+  const modelTag = benoitModel.isReady ? "NN" : "heuristic";
   console.log(
-    `[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId})`,
+    `[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId}) [${modelTag}]`,
   );
 }
 
@@ -154,9 +161,11 @@ function tryPlayWord(conn: DbConnection) {
     const key = String(matchId);
     if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) continue;
     lastWordAttemptByMatch.set(key, now);
+    const participant = participantForMatch(conn, matchId);
     const word = chooseWord({
       myRack: rackForMatch(conn, matchId),
       dictionary: DICTIONARY,
+      myBalance: participant?.balance ?? 100,
     });
     if (!word) continue;
     console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
@@ -226,6 +235,8 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   });
   conn.db.auctionResult.onInsert((_ctx, r) => {
     if (myBotId === null) return;
+    const winnerIdx = r.winnerBotId !== undefined && r.winnerBotId !== null ? Number(r.winnerBotId) : null;
+    benoitModel.eventBuffer.recordAuctionResult(winnerIdx, r.letter, Number(r.paid));
     const winner =
       r.winnerBotId !== undefined && r.winnerBotId !== null
         ? String(r.winnerBotId)
@@ -235,10 +246,15 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     );
   });
 
+  conn.db.wordPlay.onInsert((_ctx, wp) => {
+    benoitModel.eventBuffer.recordWordPlay(Number(wp.botId), wp.word, Number(wp.totalReward));
+  });
+
   // When a match this bot was in ends, hop back into the lobby.
   conn.db.matchState.onUpdate((_ctx, old, neu) => {
     if (myBotId === null) return;
     if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
+      benoitModel.eventBuffer.clear();
       const wasIn = Array.from(conn.db.matchParticipant.iter()).some(
         (p) => p.matchId === neu.id && p.botId === myBotId,
       );

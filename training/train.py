@@ -22,6 +22,7 @@ from environment import (
     BaseOpponent,
     CheapskateOpponent,
     HoarderOpponent,
+    MarketCompetitiveOpponent,
     ScrabbleBotEnv,
     ValueBidderOpponent,
 )
@@ -166,11 +167,11 @@ def compute_gae(
 def sample_opponents_for_match(snapshot_pool: SnapshotPool, num_needed: int = 5) -> List[BaseOpponent]:
     """Curriculum sampling: mix rule-based bots with past policy snapshots."""
     rule_pool = [
-        CheapskateOpponent(),
-        ValueBidderOpponent(),
+        MarketCompetitiveOpponent(),
         AggressiveOpponent(),
-        HoarderOpponent(),
         ValueBidderOpponent(),
+        HoarderOpponent(),
+        MarketCompetitiveOpponent(),
     ]
     opponents: List[BaseOpponent] = []
     for _ in range(num_needed):

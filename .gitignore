@@ -10,5 +10,6 @@ target/
 bot-starter/src/module_bindings/
 .vercel
 .env*
+
 .venv
 __pycache__

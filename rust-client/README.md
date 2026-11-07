@@ -72,6 +72,13 @@ cd "scrabblebot/bot-starter"
 BOT_NAME=alice BOT_TOKEN=<token> npm start
 ```
 
+or, if `.token-<BOT_NAME>` exists
+
+```bash
+cd "scrabblebot/bot-starter"
+BOT_NAME=<BOT_NAME> npm start
+```
+
 ### Running with a Nonce (CLI)
 ```bash
 BOT_NAME="benoit" \

@@ -42,12 +42,12 @@ cd "scrabblebot/training"
 source .venv/bin/activate
 
 # Run test suite
-python test_suite.py
+python3 test_suite.py
 
 # Train Benoit (e.g. 100,000 timesteps)
-python train.py --timesteps 100000 --encoder transformer --save-dir checkpoints
+python3 train.py --timesteps 100000 --encoder transformer --save-dir checkpoints
 
 # Export to ONNX for Rust production client
-python export_onnx.py --checkpoint checkpoints/benoit_final.pt --output ../rust-client/benoit.onnx
+python3 export_onnx.py --checkpoint checkpoints/benoit_final.pt --output ../rust-client/benoit.onnx
 ```
 

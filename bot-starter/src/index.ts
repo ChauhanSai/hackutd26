@@ -27,6 +27,7 @@ import {
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { chooseWord, decideBid, decideBidAsync } from "./strategy.js";
 import { benoitModel } from "./model_inference.js";
 
@@ -50,13 +51,15 @@ function saveToken(tok: string) {
 }
 
 // Load the shared wordlist so the bot can pick playable words locally.
-const dictionaryPath = path.join(
-  path.dirname(new URL(import.meta.url).pathname),
-  "..",
-  "..",
-  "spacetimedb",
-  "wordlist.txt",
-);
+const currentDir = path.dirname(fileURLToPath(import.meta.url));
+const candidatePaths = [
+  path.join(currentDir, "..", "..", "spacetimedb", "wordlist.txt"),
+  path.join(currentDir, "..", "spacetimedb", "wordlist.txt"),
+  path.join(process.cwd(), "spacetimedb", "wordlist.txt"),
+  path.join(process.cwd(), "..", "spacetimedb", "wordlist.txt"),
+  "/Users/saichauhan/Desktop/HackUTD '26/scrabblebot/spacetimedb/wordlist.txt",
+];
+const dictionaryPath = candidatePaths.find((p) => fs.existsSync(p)) ?? candidatePaths[0]!;
 const DICTIONARY: string[] = fs.existsSync(dictionaryPath)
   ? fs
       .readFileSync(dictionaryPath, "utf8")
@@ -65,6 +68,7 @@ const DICTIONARY: string[] = fs.existsSync(dictionaryPath)
       .filter((l) => l.length >= 2)
   : [];
 DICTIONARY.sort((a, b) => b.length - a.length); // longest first for greedy pick
+console.log(`[${BOT_NAME}] loaded ${DICTIONARY.length} words from dictionary`);
 
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
@@ -259,11 +263,104 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
         (p) => p.matchId === neu.id && p.botId === myBotId,
       );
       if (wasIn) {
+        logMatchSummary(conn, neu.id);
         console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
         joinLobby(conn);
       }
     }
   });
+}
+
+function logMatchSummary(conn: DbConnection, matchId: bigint) {
+  const participants = Array.from(conn.db.matchParticipant.iter())
+    .filter((p) => p.matchId === matchId)
+    .sort((a, b) => Number(b.score - a.score) || Number(b.balance - a.balance));
+
+  if (participants.length === 0) return;
+
+  const matchState = conn.db.matchState.id.find(matchId);
+  const startingRackSize = matchState?.startingRackSize ?? 5;
+
+  const results = Array.from(conn.db.auctionResult.iter()).filter((r) => r.matchId === matchId);
+  const plays = Array.from(conn.db.wordPlay.iter()).filter((w) => w.matchId === matchId);
+
+  console.log(`\n==================== MATCH ${matchId} FINAL RESULTS ====================`);
+  console.log(`Rank | ${"Player".padEnd(26)} | ${"Score".padStart(5)} | ${"Coins".padStart(5)} | Letters Remaining`);
+  console.log("-".repeat(78));
+
+  participants.forEach((p, idx) => {
+    const isMe = myBotId !== null && p.botId === myBotId;
+    const bot = conn.db.bot.id.find(p.botId);
+    const botName = bot?.name ?? `bot ${p.botId}`;
+    const displayName = `${botName} (${p.botId})${isMe ? " [YOU]" : ""}`.padEnd(26);
+    const scoreStr = String(p.score).padStart(5);
+    const coinsStr = String(p.balance).padStart(5);
+    const rankStr = String(idx + 1).padStart(4);
+
+    let lettersSummary = "";
+    if (isMe) {
+      const myLetters: string[] = [];
+      let totalCount = 0;
+      for (const h of conn.db.myRack.iter()) {
+        if (h.matchId !== matchId) continue;
+        for (let i = 0; i < h.count; i++) {
+          myLetters.push(h.letter);
+          totalCount++;
+        }
+      }
+      myLetters.sort();
+      lettersSummary =
+        totalCount === 0
+          ? "0 tiles"
+          : `${totalCount} tile${totalCount === 1 ? "" : "s"} (${myLetters.join(", ")})`;
+    } else {
+      const known = new Map<string, number>();
+      let hidden = startingRackSize;
+
+      for (const r of results) {
+        if (r.winnerBotId === p.botId) {
+          known.set(r.letter, (known.get(r.letter) ?? 0) + 1);
+        }
+      }
+
+      for (const wp of plays) {
+        if (wp.botId === p.botId) {
+          for (const c of wp.word) {
+            const have = known.get(c) ?? 0;
+            if (have > 0) {
+              known.set(c, have - 1);
+            } else {
+              hidden = Math.max(0, hidden - 1);
+            }
+          }
+        }
+      }
+
+      const knownList: string[] = [];
+      let knownCount = 0;
+      for (const [letter, count] of known.entries()) {
+        for (let i = 0; i < count; i++) {
+          knownList.push(letter);
+          knownCount++;
+        }
+      }
+      knownList.sort();
+
+      const totalCount = knownCount + hidden;
+      if (totalCount === 0) {
+        lettersSummary = "0 tiles";
+      } else {
+        const details: string[] = [];
+        if (knownCount > 0) details.push(knownList.join(", "));
+        if (hidden > 0) details.push(`${hidden} hidden`);
+        lettersSummary = `${totalCount} tile${totalCount === 1 ? "" : "s"} (${details.join(" + ")})`;
+      }
+    }
+
+    console.log(`${rankStr} | ${displayName} | ${scoreStr} | ${coinsStr} | ${lettersSummary}`);
+  });
+
+  console.log("=".repeat(78) + "\n");
 }
 
 function joinLobby(conn: DbConnection) {

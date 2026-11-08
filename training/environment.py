@@ -530,15 +530,16 @@ class ScrabbleBotEnv(gym.Env):
         """
         Terminal reward optimizing for 6-player win rate and relative placement.
         Sparse: 0 on all non-terminal steps.
-        Enforces severe penalty for 0 score to prevent unspent bankroll hoarding.
+        Enforces severe penalty for 0 score and penalizes holding excessive unplayed tiles at match end.
         """
         ranks = self._get_final_ranks()
         rank = ranks[player_idx]
         my_score = int(self.scores[player_idx])
+        unplayed_tiles = int(self.racks[player_idx].sum())
 
-        # Severe penalty for scoring 0 points
+        # Crushing penalty for scoring 0 points
         if my_score == 0:
-            return -1.5
+            return -2.0
 
         if self.reward_type == "win_loss":
             return 1.0 if rank == 1 else -1.0
@@ -552,6 +553,10 @@ class ScrabbleBotEnv(gym.Env):
         # with score bonus to encourage aggressive point production
         rank_rewards = {1: 1.0, 2: 0.5, 3: 0.2, 4: -0.1, 5: -0.4, 6: -0.8}
         base_reward = rank_rewards.get(rank, -0.8)
-        score_bonus = min(0.5, my_score * 0.005)
-        return float(base_reward + score_bonus)
+        score_bonus = min(0.6, my_score * 0.006)
+        
+        # Penalty for leaving tiles unplayed on rack at game end (waste of capital)
+        tile_waste_penalty = max(0.0, (unplayed_tiles - 2) * 0.04)
+
+        return float(base_reward + score_bonus - tile_waste_penalty)
 

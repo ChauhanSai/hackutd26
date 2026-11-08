@@ -14,6 +14,7 @@ from environment import (
     AUCTION_RESERVE,
     EVENT_DIM,
     EVENT_HISTORY_LEN,
+    HerculeOpponent,
     PRIVATE_DIM,
     STARTING_BALANCE,
     STARTING_RACK_SIZE,
@@ -21,7 +22,13 @@ from environment import (
 )
 from export_onnx import export_to_onnx
 from models import BenoitActorCritic
-from train import train_benoit
+from train import (
+    PolicySnapshotOpponent,
+    SnapshotPool,
+    sample_opponents_for_match,
+    train_benoit,
+    train_roger,
+)
 
 
 class TestScrabbleBotRules(unittest.TestCase):
@@ -136,6 +143,96 @@ class TestScrabbleBotRules(unittest.TestCase):
             encoder_type="gru",
         )
         self.assertTrue(os.path.exists(onnx_file))
+
+
+class TestHerculeIntegrationAndLeagueCurriculum(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dict = EnableDictionary()
+
+    def test_hercule_opponent_act(self) -> None:
+        hercule = HerculeOpponent(dictionary=self.dict)
+        rack = [0] * 26
+        # Give some tiles: P, E, R, I, U
+        for c in "PERIU":
+            rack[ord(c) - ord("A")] += 1
+
+        best_word_info = self.dict.find_best_playable(rack, min_len=2)
+        # Auction letter Q completes "PERIQUE"
+        bid, play = hercule.act(
+            player_idx=1,
+            letter="Q",
+            balance=100,
+            rack=rack,
+            best_word_info=best_word_info,
+        )
+
+        self.assertIsInstance(bid, int)
+        self.assertIsInstance(play, bool)
+        self.assertGreaterEqual(bid, 0)
+        self.assertLessEqual(bid, 100)
+
+    def test_sample_opponents_hybrid_distribution(self) -> None:
+        pool = SnapshotPool(max_size=5)
+        # Empty pool -> all HerculeOpponent
+        opps_empty = sample_opponents_for_match(pool, num_needed=5, snapshot_prob=0.3, dictionary=self.dict)
+        self.assertEqual(len(opps_empty), 5)
+        for opp in opps_empty:
+            self.assertIsInstance(opp, HerculeOpponent)
+
+        # Populate pool
+        dummy_model = BenoitActorCritic(encoder_type="gru")
+        pool.add(dummy_model)
+
+        # snapshot_prob = 0.0 -> all HerculeOpponent
+        opps_hercule_only = sample_opponents_for_match(pool, num_needed=5, snapshot_prob=0.0, dictionary=self.dict)
+        for opp in opps_hercule_only:
+            self.assertIsInstance(opp, HerculeOpponent)
+
+        # snapshot_prob = 1.0 -> all PolicySnapshotOpponent
+        opps_snapshots_only = sample_opponents_for_match(pool, num_needed=5, snapshot_prob=1.0, dictionary=self.dict)
+        for opp in opps_snapshots_only:
+            self.assertIsInstance(opp, PolicySnapshotOpponent)
+
+        # snapshot_prob = 0.5 over 100 samples -> mix of both
+        counts = {"snapshot": 0, "hercule": 0}
+        for _ in range(100):
+            sample = sample_opponents_for_match(pool, num_needed=1, snapshot_prob=0.5, dictionary=self.dict)[0]
+            if isinstance(sample, PolicySnapshotOpponent):
+                counts["snapshot"] += 1
+            elif isinstance(sample, HerculeOpponent):
+                counts["hercule"] += 1
+        self.assertGreater(counts["snapshot"], 15)
+        self.assertGreater(counts["hercule"], 15)
+
+    def test_environment_initialization_with_hercule(self) -> None:
+        hercule_opps = [HerculeOpponent(dictionary=self.dict) for _ in range(5)]
+        env = ScrabbleBotEnv(dictionary=self.dict, opponents=hercule_opps)
+        self.assertEqual(len(env.opponents), 5)
+        for opp in env.opponents:
+            self.assertIsInstance(opp, HerculeOpponent)
+
+        obs, info = env.reset(seed=99)
+        self.assertIn("private", obs)
+        # Take 3 steps
+        for _ in range(3):
+            obs, reward, term, trunc, info = env.step(np.array([0.2, 0.5], dtype=np.float32))
+            if term or trunc:
+                break
+        self.assertIsNotNone(obs)
+
+    def test_train_roger_interface(self) -> None:
+        # Verify train_roger can run with snapshot_prob parameter
+        model = train_roger(
+            total_timesteps=1024,
+            steps_per_batch=512,
+            epochs_per_batch=1,
+            minibatch_size=64,
+            encoder_type="gru",
+            save_dir="test_checkpoints",
+            snapshot_prob=0.4,
+        )
+        self.assertIsNotNone(model)
+        self.assertTrue(os.path.exists("test_checkpoints/roger_final.pt"))
 
 
 if __name__ == "__main__":

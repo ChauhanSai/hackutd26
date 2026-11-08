@@ -1,6 +1,7 @@
 """
-Self-play Reinforcement Learning training script for Benoit ScrabbleBot.
-Uses PPO with Generalized Advantage Estimation (GAE) and frozen snapshot self-play curriculum.
+Self-play Reinforcement Learning training script for Roger Scrabble-bot.
+Uses PPO with Generalized Advantage Estimation (GAE) and a hybrid league-training curriculum
+combining Hercule high-skill baseline opponents and frozen past policy snapshots.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from environment import (
     AggressiveOpponent,
     BaseOpponent,
     CheapskateOpponent,
+    HerculeOpponent,
     HoarderOpponent,
     MarketCompetitiveOpponent,
     ScrabbleBotEnv,
@@ -62,12 +64,13 @@ class PolicySnapshotOpponent(BaseOpponent):
 
         ev = np.zeros((32, 38), dtype=np.float32)
 
-        priv_t = torch.from_numpy(priv).unsqueeze(0)
-        ev_t = torch.from_numpy(ev).unsqueeze(0)
+        device = next(self.model.parameters()).device
+        priv_t = torch.from_numpy(priv).unsqueeze(0).to(device)
+        ev_t = torch.from_numpy(ev).unsqueeze(0).to(device)
 
         with torch.no_grad():
             action, _ = self.model.act_deterministic(priv_t, ev_t)
-            action_np = action.squeeze(0).numpy()
+            action_np = action.squeeze(0).cpu().numpy()
 
         bid_frac = float(np.clip(action_np[0], 0.0, 1.0))
         bid = int(round(bid_frac * balance))
@@ -164,28 +167,43 @@ def compute_gae(
     return advantages, returns
 
 
-def sample_opponents_for_match(snapshot_pool: SnapshotPool, num_needed: int = 5) -> List[BaseOpponent]:
-    """Curriculum sampling: mix rule-based bots with past policy snapshots."""
-    rule_pool = [
-        MarketCompetitiveOpponent(),
-        AggressiveOpponent(),
-        ValueBidderOpponent(),
-        HoarderOpponent(),
-        MarketCompetitiveOpponent(),
-    ]
+def sample_opponents_for_match(
+    snapshot_pool: SnapshotPool,
+    num_needed: int = 5,
+    snapshot_prob: float = 0.3,
+    dictionary: Optional[EnableDictionary] = None,
+    rule_pool: Optional[List[BaseOpponent]] = None,
+) -> List[BaseOpponent]:
+    """
+    Curriculum sampling: hybrid distribution between frozen past iterations of Roger
+    (SnapshotPool) to prevent mode collapse, and Hercule bots to serve as a high-skill
+    baseline anchor.
+
+    Args:
+        snapshot_pool: Pool of frozen past snapshots of Roger.
+        num_needed: Number of opponent slots to fill (typically 5 for 6-player matches).
+        snapshot_prob: Probability of sampling a snapshot vs Hercule anchor.
+        dictionary: Optional shared EnableDictionary for Hercule instances.
+        rule_pool: Optional fallback/augmentation rule pool; defaults to HerculeOpponent.
+    """
     opponents: List[BaseOpponent] = []
     for _ in range(num_needed):
-        # 20% chance to pick snapshot if available, 80% rule-based
-        if snapshot_pool.snapshots and random.random() < 0.2:
+        # Sample frozen past snapshot with probability snapshot_prob if available
+        if snapshot_pool.snapshots and random.random() < snapshot_prob:
             opp = snapshot_pool.sample_opponent()
-            if opp:
+            if opp is not None:
                 opponents.append(opp)
                 continue
-        opponents.append(random.choice(rule_pool))
+
+        # Remainder filled by HerculeOpponent anchor (or rule_pool if explicitly provided)
+        if rule_pool is not None and len(rule_pool) > 0:
+            opponents.append(random.choice(rule_pool))
+        else:
+            opponents.append(HerculeOpponent(dictionary=dictionary))
     return opponents
 
 
-def train_benoit(
+def train_roger(
     total_timesteps: int = 50_000,
     steps_per_batch: int = 2048,
     epochs_per_batch: int = 4,
@@ -200,19 +218,28 @@ def train_benoit(
     encoder_type: str = "transformer",
     save_dir: str = "checkpoints",
     snapshot_interval: int = 5,
+    snapshot_prob: float = 0.3,
 ) -> BenoitActorCritic:
-    """Train Benoit using PPO with self-play curriculum."""
+    """Train Roger using PPO with Hercule hybrid league-training curriculum."""
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training Benoit on device: {device} | Encoder: {encoder_type}")
+    print(f"Training Roger on device: {device} | Encoder: {encoder_type} | Snapshot Prob: {snapshot_prob}")
 
     shared_dict = EnableDictionary()
-    env = ScrabbleBotEnv(dictionary=shared_dict, reward_type="dense")
+    snapshot_pool = SnapshotPool(max_size=10)
+
+    # Initialize environment with hybrid Hercule opponent baseline
+    initial_opps = sample_opponents_for_match(
+        snapshot_pool,
+        num_needed=5,
+        snapshot_prob=snapshot_prob,
+        dictionary=shared_dict,
+    )
+    env = ScrabbleBotEnv(dictionary=shared_dict, reward_type="dense", opponents=initial_opps)
 
     model = BenoitActorCritic(encoder_type=encoder_type).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
 
-    snapshot_pool = SnapshotPool(max_size=10)
     buffer = RolloutBuffer()
 
     num_iterations = total_timesteps // steps_per_batch
@@ -231,7 +258,12 @@ def train_benoit(
         steps_collected = 0
         while steps_collected < steps_per_batch:
             # Set curriculum opponents for this match
-            opps = sample_opponents_for_match(snapshot_pool, num_needed=env.num_players - 1)
+            opps = sample_opponents_for_match(
+                snapshot_pool,
+                num_needed=env.num_players - 1,
+                snapshot_prob=snapshot_prob,
+                dictionary=shared_dict,
+            )
             env.set_opponents(opps)
 
             obs, _ = env.reset()
@@ -367,42 +399,48 @@ def train_benoit(
         # Periodic snapshot addition for curriculum
         if iteration % snapshot_interval == 0:
             snapshot_pool.add(model)
-            ckpt_path = os.path.join(save_dir, f"benoit_iter_{iteration}.pt")
-            torch.save(
-                {
-                    "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "iteration": iteration,
-                    "encoder_type": encoder_type,
-                },
-                ckpt_path,
-            )
+            ckpt_path = os.path.join(save_dir, f"roger_iter_{iteration}.pt")
+            legacy_ckpt_path = os.path.join(save_dir, f"benoit_iter_{iteration}.pt")
+            save_payload = {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "iteration": iteration,
+                "encoder_type": encoder_type,
+            }
+            torch.save(save_payload, ckpt_path)
+            torch.save(save_payload, legacy_ckpt_path)
             print(f" Saved snapshot to pool and checkpoint to {ckpt_path}")
 
     # Final save
-    final_path = os.path.join(save_dir, "benoit_final.pt")
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "encoder_type": encoder_type,
-        },
-        final_path,
-    )
+    final_path = os.path.join(save_dir, "roger_final.pt")
+    legacy_final_path = os.path.join(save_dir, "benoit_final.pt")
+    final_payload = {
+        "model_state": model.state_dict(),
+        "encoder_type": encoder_type,
+    }
+    torch.save(final_payload, final_path)
+    torch.save(final_payload, legacy_final_path)
     print(f"Training complete. Final model saved to {final_path}")
     return model
 
 
+# Backward-compatible alias
+train_benoit = train_roger
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Benoit ScrabbleBot with PPO self-play")
+    parser = argparse.ArgumentParser(description="Train Roger ScrabbleBot with PPO hybrid league curriculum")
     parser.add_argument("--timesteps", type=int, default=30_000, help="Total training timesteps")
     parser.add_argument("--batch-size", type=int, default=2048, help="Rollout batch size")
     parser.add_argument("--encoder", type=str, default="transformer", choices=["transformer", "gru"])
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save models")
+    parser.add_argument("--snapshot-prob", type=float, default=0.3, help="Curriculum snapshot sampling probability (vs Hercule anchor)")
     args = parser.parse_args()
 
-    train_benoit(
+    train_roger(
         total_timesteps=args.timesteps,
         steps_per_batch=args.batch_size,
         encoder_type=args.encoder,
         save_dir=args.save_dir,
+        snapshot_prob=args.snapshot_prob,
     )

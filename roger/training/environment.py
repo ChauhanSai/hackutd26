@@ -5,6 +5,7 @@ Optimized for high-throughput headless vectorization and self-play.
 
 from __future__ import annotations
 import collections
+import math
 import random
 from typing import Any, Dict, List, Optional, Tuple, Union
 import gymnasium as gym
@@ -177,6 +178,237 @@ class MarketCompetitiveOpponent(BaseOpponent):
         return bid, play
 
 
+HERCULE_LETTER_AFFINITY: Dict[str, float] = {
+    "A": 0.0, "B": 0.0586, "C": 0.1811, "D": 0.0221, "E": 0.0051,
+    "F": 0.1338, "G": 0.0, "H": 0.2165, "I": 0.0, "J": 0.2694,
+    "K": 0.2589, "L": 0.0, "M": 0.0623, "N": 0.0, "O": 0.0,
+    "P": 0.1637, "Q": 0.41, "R": 0.0, "S": 0.0, "T": 0.0,
+    "U": 0.0, "V": 0.0284, "W": 0.0724, "X": 0.3226, "Y": 0.2401,
+    "Z": 0.4191,
+}
+
+HERCULE_WORD_PRIORS: List[Dict[str, Any]] = [
+    {"word": "PERIQUE", "reward": 54, "games": 4, "bots": 4},
+    {"word": "JOINERY", "reward": 51, "games": 4, "bots": 3},
+    {"word": "YANQUIS", "reward": 57, "games": 3, "bots": 3},
+    {"word": "FAVORED", "reward": 42, "games": 5, "bots": 3},
+    {"word": "FOVEATED", "reward": 45, "games": 3, "bots": 3},
+    {"word": "QUANTIC", "reward": 54, "games": 3, "bots": 2},
+    {"word": "WHARFED", "reward": 51, "games": 3, "bots": 2},
+    {"word": "EXORDIA", "reward": 45, "games": 3, "bots": 2},
+    {"word": "JANITOR", "reward": 42, "games": 3, "bots": 2},
+    {"word": "JIVER", "reward": 30, "games": 3, "bots": 3},
+]
+
+FREQUENCY: List[int] = [
+    9, 2, 2, 4, 12, 2, 3, 2, 9, 1, 1, 4, 2, 6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1
+]
+
+SCORING_SETTINGS_HERCULE: Dict[str, Any] = {
+    "common": 12,
+    "other": 9,
+    "rare": 7,
+    "fraction": 0.55,
+    "reserve": 8,
+    "gain": 0.9,
+    "cashOut": 18,
+    "holdGain": 3,
+    "denial": 0.75,
+    "dualPremium": 4,
+}
+
+HERCULE_PRECOMPUTED_PRIORS: List[Tuple[str, int, List[Tuple[int, int, str]]]] = []
+for _p in HERCULE_WORD_PRIORS:
+    _word = _p["word"]
+    _reward = int(_p["reward"])
+    _counts: Dict[int, int] = {}
+    for _c in _word:
+        _ci = ord(_c) - ord("A")
+        _counts[_ci] = _counts.get(_ci, 0) + 1
+    _items = [(_ci, _count, chr(ord("A") + _ci)) for _ci, _count in _counts.items()]
+    HERCULE_PRECOMPUTED_PRIORS.append((_word, _reward, _items))
+
+
+def find_public_hercule_goal(
+    rack: List[int], remaining: int
+) -> Optional[Tuple[str, int, int, List[str], float]]:
+    """
+    Evaluates public word priors for Hercule offensive planning.
+    Returns: (word, reward, missing_count, missing_letters, expected_gain) or None
+    """
+    best_goal = None
+    best_gain = -1.0
+    for word, reward, letter_needs in HERCULE_PRECOMPUTED_PRIORS:
+        missing_letters: List[str] = []
+        likelihood = 1.0
+        held = 0
+        possible = True
+        for ci, need_count, char in letter_needs:
+            if need_count > FREQUENCY[ci]:
+                possible = False
+                break
+            have_count = rack[ci]
+            lack = max(0, need_count - have_count)
+            held += min(need_count, have_count)
+            for _ in range(lack):
+                missing_letters.append(char)
+            if lack > 0:
+                likelihood *= min(1.0, FREQUENCY[ci] / 5.0) ** lack
+
+        missing = len(missing_letters)
+        if not possible or held < 4 or missing > 3 or missing > max(0, remaining):
+            continue
+
+        factor = 1.0 if missing == 0 else (0.7 if missing == 1 else (0.35 if missing == 2 else 0.12))
+        expected_gain = reward * factor * likelihood * min(
+            1.0, max(0.0, remaining - 1.0) / max(1.0, missing * 8.0)
+        )
+        if expected_gain > best_gain:
+            best_gain = expected_gain
+            best_goal = (word, reward, missing, missing_letters, expected_gain)
+    return best_goal
+
+
+class HerculeOpponent(BaseOpponent):
+    """
+    High-skill league baseline opponent wrapping the Hercule bot logic.
+    Features:
+      - Superlinear multiplier-driven aggressive word planning & cashing
+      - Public-word priors (PERIQUE, JOINERY, YANQUIS, etc.)
+      - High-tier letter affinity bids
+      - Defensive bankroll reserve & liquidity capping
+    """
+
+    def __init__(
+        self,
+        name: str = "Hercule",
+        dictionary: Optional[EnableDictionary] = None,
+        max_extra: int = 6,
+    ) -> None:
+        super().__init__(name)
+        self.dict = dictionary or EnableDictionary()
+        self.max_extra = max_extra
+        self.round_num = 0
+
+    def reset(self) -> None:
+        self.round_num = 0
+
+    def act(
+        self,
+        player_idx: int,
+        letter: str,
+        balance: int,
+        rack: List[int],
+        best_word_info: Tuple[Optional[str], int, int, int],
+    ) -> Tuple[int, bool]:
+        self.round_num += 1
+        letter = letter.upper()
+        if not ("A" <= letter <= "Z") or balance < 1:
+            return 0, False
+
+        remaining = max(0, 68 - self.round_num)
+        progress = min(1.0, self.round_num / 68.0)
+        cli = ord(letter) - ord("A")
+        have = rack[cli]
+        size = sum(rack)
+        ending = remaining <= 8 or progress >= 0.88
+
+        # 1. Baseline own-value gain & goal potential
+        score_before = best_word_info[1] if best_word_info[0] is not None else 0
+        rack_plus = list(rack)
+        rack_plus[cli] += 1
+        _, score_after, _, _ = self.dict.find_best_playable(rack_plus, min_len=2)
+        own_gain = max(0, score_after - score_before)
+
+        goal_before = find_public_hercule_goal(rack, remaining)
+        goal_after = find_public_hercule_goal(rack_plus, remaining)
+
+        exp_before = goal_before[4] if goal_before is not None else 0.0
+        exp_after = goal_after[4] if goal_after is not None else 0.0
+        own_potential = max(0.0, exp_after - exp_before)
+
+        # 2. Compute ownDesire
+        common = letter in "AEIOUNRSTL"
+        val = LETTER_VALUES.get(letter, 1)
+        if common:
+            explore = SCORING_SETTINGS_HERCULE["common"]  # 12
+        elif val >= 8:
+            explore = SCORING_SETTINGS_HERCULE["rare"]    # 7
+        else:
+            explore = SCORING_SETTINGS_HERCULE["other"]   # 9
+
+        if have >= 2:
+            explore = int(explore * 0.25)
+
+        vowels = sum(rack[ord(c) - ord("A")] for c in "AEIOU")
+        if size >= 4:
+            if (vowels / size < 0.25 and letter in "AEIOU") or (vowels / size > 0.55 and letter not in "AEIOU"):
+                explore += 2
+
+        if size >= 9 and own_gain == 0 and own_potential < 2.0:
+            explore = min(explore, 2)
+
+        if ending and own_gain == 0:
+            explore = 0
+
+        gain_val = max(float(own_gain), own_potential)
+        desire = max(
+            explore,
+            int(math.ceil(SCORING_SETTINGS_HERCULE["gain"] * gain_val + (2 if own_gain > 0 else 0)))
+        )
+
+        # Budget calculation
+        reserve = 0 if ending else min(SCORING_SETTINGS_HERCULE["reserve"], int(balance * 0.15))
+        budget_frac = 0.95 if ending else SCORING_SETTINGS_HERCULE["fraction"]
+        budget = max(0, min(balance - reserve, max(1, int(balance * budget_frac))))
+        baseline = min(budget, desire)
+
+        # 3. Hercule public-word and affinity lifts
+        affinity = HERCULE_LETTER_AFFINITY.get(letter, 0.0)
+        productive = max(float(own_gain), own_potential) >= 8.0
+        advances = (goal_before is not None) and (letter in goal_before[3]) and (goal_before[2] <= 2)
+
+        goal_lift = max(0.0, exp_after - exp_before) * 0.75 if (advances and goal_before is not None) else 0.0
+        letter_lift = (self.max_extra * affinity * 1.8) if productive else 0.0
+        desired = min(self.max_extra, int(math.ceil(max(goal_lift, letter_lift))))
+
+        if have >= 2 or (remaining <= 8 and own_gain == 0):
+            desired = 0
+
+        cap_frac = 0.95 if ending else 0.65
+        cap = max(0, min(balance - reserve, int(balance * cap_frac)))
+        bid_amount = max(baseline, min(cap, baseline + desired))
+        bid = max(0, min(balance, bid_amount))
+
+        # 4. Word play decision
+        play = False
+        word, score, length, bonus = best_word_info
+        if word is not None:
+            if length >= 7:
+                play = True
+            else:
+                flush = (
+                    balance <= SCORING_SETTINGS_HERCULE["cashOut"]
+                    or remaining <= 5
+                    or progress >= 0.92
+                    or size >= 13
+                )
+                if flush:
+                    play = True
+                elif (
+                    goal_before is not None
+                    and goal_before[4] >= max(SCORING_SETTINGS_HERCULE["holdGain"], score * 0.12)
+                    and remaining > 8
+                    and progress < 0.86
+                ):
+                    # Hold tiles for the prior goal
+                    play = False
+                elif length >= 5 or (score >= 8 and (score / max(length, 1)) >= 3.5) or size >= 10:
+                    play = True
+
+        return bid, play
+
+
 class ScrabbleBotEnv(gym.Env):
     """
     Gymnasium environment for a 6-player Scrabble-style Vickrey auction game.
@@ -193,6 +425,7 @@ class ScrabbleBotEnv(gym.Env):
         history_len: int = EVENT_HISTORY_LEN,
         flatten_obs: bool = False,
         reward_type: str = "rank",  # "rank", "win_loss", "score_margin"
+        opponents: Optional[List[BaseOpponent]] = None,
     ) -> None:
         super().__init__()
         self.dict = dictionary or EnableDictionary()
@@ -240,7 +473,10 @@ class ScrabbleBotEnv(gym.Env):
 
         # Opponents setup
         self.opponents: List[BaseOpponent] = []
-        self._init_default_opponents()
+        if opponents is not None:
+            self.set_opponents(opponents)
+        else:
+            self._init_default_opponents()
 
         # Match state
         self.bag: List[str] = []
@@ -256,11 +492,11 @@ class ScrabbleBotEnv(gym.Env):
 
     def _init_default_opponents(self) -> None:
         pool = [
+            HerculeOpponent(dictionary=self.dict),
             MarketCompetitiveOpponent(),
             AggressiveOpponent(),
             ValueBidderOpponent(),
             HoarderOpponent(),
-            MarketCompetitiveOpponent(),
         ]
         self.opponents = pool[: self.num_players - 1]
 

@@ -84,9 +84,11 @@ class EnableDictionary:
         if wordlist_path is None:
             # Look relative to project root or current directory
             candidates = [
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "spacetimedb", "wordlist.txt")),
                 os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scrabblebot", "spacetimedb", "wordlist.txt")),
                 os.path.abspath(os.path.join(os.path.dirname(__file__), "wordlist.txt")),
                 "/Users/saichauhan/Desktop/HackUTD '26/scrabblebot/spacetimedb/wordlist.txt",
+                "/Users/saichauhan/Desktop/HackUTD '26/roger/spacetimedb/wordlist.txt",
             ]
             for c in candidates:
                 if os.path.exists(c):

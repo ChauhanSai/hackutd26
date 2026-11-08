@@ -1,0 +1,2 @@
+# The game dictionary parser splits on LF and compares words verbatim.
+spacetimedb/wordlist.txt text eol=lf

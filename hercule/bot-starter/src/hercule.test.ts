@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import {test} from 'node:test';
+import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join,dirname,resolve,basename} from 'node:path';
+import {makeHerculeAgent} from './local-arena.js';
+import {decideHerculeBid,chooseHerculeWord,HERCULE_POLICY_VERSION,HERCULE_ACTIVE_CONFIG} from './hercule.js';
+import {scoringBid,SCORING_POLICY_VERSION} from './scoring-v3.js';
+import {Study,type MatchResult} from './study.js';
+const rack=(text:string)=>new Map([...new Set(text)].map(c=>[c,[...text].filter(x=>x===c).length]));
+test('default arena and live-facing hercule-v1 share the selected offense-only policy',()=>{
+  const ctx={myRack:rack('PERIUE'),publicKnownRack:new Map<string,number>(),dictionary:['PERIQUE'],myBalance:100,myScore:0,remainingTiles:30,progress:.3,letter:'Q',auctionType:'Vickrey' as const,opponents:[]};
+  assert.equal(HERCULE_ACTIVE_CONFIG.id,'public-six');
+  assert.equal(makeHerculeAgent().bid(ctx),decideHerculeBid(ctx).amount);assert.equal(makeHerculeAgent().word(ctx),chooseHerculeWord(ctx));
+  assert.equal(makeHerculeAgent(1.6).bid(ctx),scoringBid(ctx,[],'hercule',1.6).amount);
+});
+test('fixed Hercule practice ignores old pressure plans and refuses to mix old policy sessions',t=>{
+  const oldPlan=process.env.BOT_TRAIN_PLAN,oldResume=process.env.BOT_TRAIN_RESUME,root=mkdtempSync(join(tmpdir(),'hercule-practice-'));
+  t.after(()=>{if(oldPlan===undefined)delete process.env.BOT_TRAIN_PLAN;else process.env.BOT_TRAIN_PLAN=oldPlan;if(oldResume===undefined)delete process.env.BOT_TRAIN_RESUME;else process.env.BOT_TRAIN_RESUME=oldResume;
+    assert.equal(dirname(resolve(root)),resolve(tmpdir()));assert.ok(basename(root).startsWith('hercule-practice-'));rmSync(root,{recursive:true,force:true});});
+  process.env.BOT_TRAIN_PLAN='pressure,pressure,assertive';delete process.env.BOT_TRAIN_RESUME;
+  const study=new Study(true,1,root,{botName:'hercule-v1',strategy:'hercule'});
+  assert.deepEqual(study.assign('partial',true,'pressure'),{profile:'hercule',phase:'partial'});
+  assert.deepEqual(study.assign('1',false,'pressure'),{profile:'hercule',phase:'validation'});
+  const game:MatchResult={matchId:'1',profile:'hercule',phase:'validation',score:54,rank:1,opponents:[],defensiveBids:0,defensiveWins:0,defensiveSpend:0,totalSpend:30,words:[{word:'PERIQUE',reward:54}]};
+  assert.equal(study.complete({...game,matchId:'partial',phase:'partial'}),false);assert.equal(study.complete(game),true);
+  const saved=JSON.parse(readFileSync(join(study.dir,'results.json'),'utf8'));assert.equal(saved.selected,'hercule');assert.equal(saved.weight,0);assert.equal(saved.plan,null);assert.equal(saved.policyVersion,HERCULE_POLICY_VERSION);
+  assert.ok(readFileSync(join(study.dir,'REPORT.md'),'utf8').includes('No defensive bidding or profile tuning'));
+  writeFileSync(join(study.dir,'results.json'),JSON.stringify({...saved,policyVersion:SCORING_POLICY_VERSION}));process.env.BOT_TRAIN_RESUME=basename(study.dir);
+  assert.throws(()=>new Study(true,1,root,{botName:'hercule-v1',strategy:'hercule'}),/different policy version/);
+});

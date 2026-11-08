@@ -1,0 +1,34 @@
+{
+  "name": "scrabblebot-bot-starter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "node scripts/generate-bindings.mjs",
+    "start": "tsx src/online.ts",
+    "start:wags": "tsx src/wags-main.ts",
+    "start:victor": "tsx src/victor-main.ts",
+    "victor:check": "tsx src/victor-check.ts",
+    "wags:check": "tsx src/wags-check.ts",
+    "train": "tsx src/online.ts --train",
+    "test": "node --import tsx --test --test-concurrency=1 src/strategy.test.ts src/dictionary.test.ts src/defense.test.ts src/study.test.ts src/online-evaluation.test.ts src/online-progress.test.ts src/public-opponents.test.ts src/wags.test.ts src/local-arena.test.ts src/planning.test.ts src/competition.test.ts src/victor.test.ts src/scoring-v3.test.ts src/hercule-policy.test.ts src/hercule.test.ts src/hercule-live.test.ts",
+    "build": "tsc",
+    "check": "npm run test && npm run build",
+    "smoke": "tsx src/smoke.ts",
+    "opponents:download": "node scripts/download-opponents.mjs",
+    "opponents:fit": "tsx scripts/fit-public-opponents.mjs",
+    "test:local": "tsx scripts/run-local-tests.mjs",
+    "test:reframed": "tsx scripts/test-reframed.mjs",
+    "test:upgrade": "tsx scripts/test-upgrade.mjs"
+  },
+  "dependencies": {
+    "spacetimedb": "^2.12.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.9.3"
+  }
+}

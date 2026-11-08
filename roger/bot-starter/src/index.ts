@@ -1,57 +1,64 @@
-// ScrabbleBot bot starter.
+// ScrabbleBot bot starter (Roger).
 //
-// First run, with a token from the website:
-//   On your team's page, click "Generate token", then run
-//   `BOT_NAME=<name> BOT_TOKEN=<token> npm start`.
-//
-// Or with a nonce from the CLI:
-//   1. `spacetime call scrabblebot mint_credential_nonce`
-//      `spacetime sql 'SELECT code FROM my_nonces ORDER BY expires_at DESC'`
-//   2. `BOT_NAME=<name> BOT_NONCE=<code> npm start`
-//      The bot connects fresh and redeems the nonce.
-//
-// Either way the bot saves its token to .token-<BOT_NAME>, so later runs
-// need only `BOT_NAME=<name> npm start`.
-//
-// Entering a tournament: `BOT_NAME=<name> TOURNAMENT_ID=<id> npm start`
-// registers the bot for that tournament when it connects. Only the bot
-// itself can register, so this has to come from the bot's process.
-//
-// Edit ./src/strategy.ts to customise how your bot bids and plays words.
+// Fast, robust online queueing and real-time ONNX bidding/play model.
 
 import {
   DbConnection,
   type EventContext,
   type ErrorContext,
+  type SubscriptionHandle,
 } from "./module_bindings/index.js";
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { chooseWord, decideBid, decideBidAsync } from "./strategy.js";
+import { chooseWord, decideBidAsync } from "./strategy.js";
 import { benoitModel } from "./model_inference.js";
 
+const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
-const BOT_NAME = process.env.BOT_NAME ?? "bot";
+const BOT_NAME = process.env.BOT_NAME ?? "roger";
 const BOT_TOKEN = process.env.BOT_TOKEN; // from the website, first run only
 const BOT_NONCE = process.env.BOT_NONCE; // from the CLI, first run only
 const TOURNAMENT_ID = process.env.TOURNAMENT_ID;
-const TOKEN_PATH = path.join(process.cwd(), `.token-${BOT_NAME}`);
+
+const tokenCandidates = [
+  path.join(process.cwd(), `.token-${BOT_NAME}`),
+  path.join(currentDir, "..", `.token-${BOT_NAME}`),
+  path.join(process.cwd(), ".token-benoit"),
+  path.join(currentDir, "..", ".token-benoit"),
+];
 
 function loadToken(): string | undefined {
-  try {
-    return fs.readFileSync(TOKEN_PATH, "utf8").trim() || undefined;
-  } catch {
-    return undefined;
+  for (const candidate of tokenCandidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        const tok = fs.readFileSync(candidate, "utf8").trim();
+        if (tok) return tok;
+      }
+    } catch {
+      // ignore
+    }
   }
+  return undefined;
 }
+
 function saveToken(tok: string) {
-  fs.writeFileSync(TOKEN_PATH, tok);
+  const savePaths = [
+    path.join(process.cwd(), `.token-${BOT_NAME}`),
+    path.join(currentDir, "..", `.token-${BOT_NAME}`),
+  ];
+  for (const p of savePaths) {
+    try {
+      fs.writeFileSync(p, tok);
+    } catch {
+      // ignore
+    }
+  }
 }
 
 // Load the shared wordlist so the bot can pick playable words locally.
-const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const candidatePaths = [
   path.join(currentDir, "..", "..", "spacetimedb", "wordlist.txt"),
   path.join(currentDir, "..", "spacetimedb", "wordlist.txt"),
@@ -72,6 +79,9 @@ console.log(`[${BOT_NAME}] loaded ${DICTIONARY.length} words from dictionary`);
 
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
+let activeMatchId: bigint | null = null;
+let matchSub: SubscriptionHandle | null = null;
+const finishedMatches = new Set<string>();
 const bidsByAuction = new Set<string>();
 const lastWordAttemptByMatch = new Map<string, number>();
 const WORD_RETRY_MS = 500;
@@ -107,10 +117,6 @@ function participantForMatch(
   return null;
 }
 
-// A reducer call fails when the module refuses it, often for an expected
-// reason: a word played just after its match ended, a bid that missed the
-// auction's window. Log it and keep playing; an uncaught failure would stop
-// the bot.
 function logFailure(what: string) {
   return (err: unknown) =>
     console.warn(
@@ -124,9 +130,10 @@ async function tryBid(
   matchId: bigint,
   letter: string,
 ) {
-  if (myBotId === null) return;
   const key = `${matchId}:${auctionId}`;
   if (bidsByAuction.has(key)) return;
+  bidsByAuction.add(key);
+
   const participant = participantForMatch(conn, matchId);
   if (!participant) return;
   const rack = rackForMatch(conn, matchId);
@@ -143,132 +150,80 @@ async function tryBid(
   conn.reducers
     .submitBid({ auctionId, amount: BigInt(amount) })
     .catch(logFailure(`bid on auction ${auctionId}`));
-  bidsByAuction.add(key);
   const modelTag = benoitModel.isReady ? "NN" : "heuristic";
   console.log(
     `[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId}) [${modelTag}]`,
   );
 }
 
-function tryPlayWord(conn: DbConnection) {
-  if (myBotId === null) return;
-  // Only matches still being played. The bot keeps its letters from
-  // matches that have ended, but can't play them.
-  const matches = new Set<bigint>();
-  for (const p of conn.db.matchParticipant.iter()) {
-    if (p.botId !== myBotId) continue;
-    const m = conn.db.matchState.id.find(p.matchId);
-    if (m?.status.tag === "Running") matches.add(p.matchId);
-  }
+function tryPlayWord(conn: DbConnection, matchId = activeMatchId) {
+  if (matchId === null) return;
+  const m = conn.db.matchState.id.find(matchId);
+  if (m?.status.tag !== "Running") return;
+
+  const key = String(matchId);
   const now = Date.now();
-  for (const matchId of matches) {
-    const key = String(matchId);
-    if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) continue;
-    lastWordAttemptByMatch.set(key, now);
-    const participant = participantForMatch(conn, matchId);
-    const word = chooseWord({
-      myRack: rackForMatch(conn, matchId),
-      dictionary: DICTIONARY,
-      myBalance: participant?.balance ?? 100,
-    });
-    if (!word) continue;
-    console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
-    conn.reducers
-      .submitWord({ matchId, word })
-      .catch(logFailure(`playing '${word}'`));
-  }
+  if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) return;
+  lastWordAttemptByMatch.set(key, now);
+
+  const participant = participantForMatch(conn, matchId);
+  const word = chooseWord({
+    myRack: rackForMatch(conn, matchId),
+    dictionary: DICTIONARY,
+    myBalance: participant?.balance ?? 100,
+  });
+  if (!word) return;
+  console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
+  conn.reducers
+    .submitWord({ matchId, word })
+    .catch(logFailure(`playing '${word}'`));
 }
 
-function onConnect(conn: DbConnection, identity: Identity, token: string) {
-  myIdentity = identity;
-  saveToken(token);
-  console.log(`[${BOT_NAME}] connected as ${identity.toHexString()}`);
+function attachMatch(conn: DbConnection, matchId: bigint) {
+  if (activeMatchId === matchId || finishedMatches.has(String(matchId))) return;
+  const m = conn.db.matchState.id.find(matchId);
+  if (m?.status.tag !== "Running") return;
 
-  conn
+  activeMatchId = matchId;
+  console.log(`[${BOT_NAME}] *** ENTERED MATCH ${matchId} ***`);
+
+  matchSub?.unsubscribe();
+  matchSub = conn
     .subscriptionBuilder()
+    .onError((ctx) => {
+      console.warn(`[${BOT_NAME}] match ${matchId} subscription error: ${ctx.event}`);
+    })
     .onApplied(() => {
-      console.log(`[${BOT_NAME}] subscription applied`);
-
-      // Resolve our bot id, possibly after claiming a nonce.
-      myBotId = resolveMyBotId(conn);
-      if (myBotId === null) {
-        if (BOT_NONCE) {
-          console.log(`[${BOT_NAME}] claiming credential with nonce…`);
-          conn.reducers
-            .claimCredential({ code: BOT_NONCE })
-            .catch(logFailure("claiming the credential"));
-          // Wait briefly for the credential to land; check again.
-          setTimeout(() => {
-            myBotId = resolveMyBotId(conn);
-            if (myBotId === null) {
-              console.error(
-                `[${BOT_NAME}] couldn't claim credential. Bad / expired nonce?`,
-              );
-              process.exit(1);
-            }
-            const bot = conn.db.bot.id.find(myBotId);
-            console.log(
-              `[${BOT_NAME}] claimed credential for bot '${bot?.name ?? "?"}' (id ${myBotId})`,
-            );
-            bootstrapActivity(conn);
-          }, 1000);
-          return;
-        } else {
-          console.error(
-            `[${BOT_NAME}] no BotCredential for this token. Set BOT_TOKEN or BOT_NONCE and re-run.`,
-          );
-          process.exit(1);
+      console.log(`[${BOT_NAME}] match ${matchId} subscription live`);
+      for (const a of conn.db.auction.iter()) {
+        if (a.matchId === matchId && a.status.tag === "Open") {
+          tryBid(conn, a.id, matchId, a.letter);
         }
       }
-
-      const bot = conn.db.bot.id.find(myBotId);
-      console.log(
-        `[${BOT_NAME}] acting as bot '${bot?.name ?? "?"}' (id ${myBotId})`,
-      );
-      bootstrapActivity(conn);
+      tryPlayWord(conn, matchId);
     })
-    .subscribeToAllTables();
+    .subscribe([
+      `SELECT * FROM match_state WHERE id = ${matchId}`,
+      `SELECT * FROM match_participant WHERE match_id = ${matchId}`,
+      `SELECT * FROM auction WHERE match_id = ${matchId}`,
+      `SELECT * FROM auction_result WHERE match_id = ${matchId}`,
+      `SELECT * FROM word_play WHERE match_id = ${matchId}`,
+      `SELECT * FROM my_rack WHERE match_id = ${matchId}`,
+    ]);
+}
 
-  conn.db.auction.onInsert((_ctx: EventContext, a) => {
-    if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
-  });
-  conn.db.myRack.onInsert(() => tryPlayWord(conn));
-  conn.db.myRack.onUpdate(() => tryPlayWord(conn));
-  conn.db.botCredential.onInsert(() => {
-    if (myBotId === null) myBotId = resolveMyBotId(conn);
-  });
-  conn.db.auctionResult.onInsert((_ctx, r) => {
-    if (myBotId === null) return;
-    const winnerIdx = r.winnerBotId !== undefined && r.winnerBotId !== null ? Number(r.winnerBotId) : null;
-    benoitModel.eventBuffer.recordAuctionResult(winnerIdx, r.letter, Number(r.paid));
-    const winner =
-      r.winnerBotId !== undefined && r.winnerBotId !== null
-        ? String(r.winnerBotId)
-        : "no-bid";
-    console.log(
-      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid}`,
-    );
-  });
-
-  conn.db.wordPlay.onInsert((_ctx, wp) => {
-    benoitModel.eventBuffer.recordWordPlay(Number(wp.botId), wp.word, Number(wp.totalReward));
-  });
-
-  // When a match this bot was in ends, hop back into the lobby.
-  conn.db.matchState.onUpdate((_ctx, old, neu) => {
-    if (myBotId === null) return;
-    if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
-      benoitModel.eventBuffer.clear();
-      const wasIn = Array.from(conn.db.matchParticipant.iter()).some(
-        (p) => p.matchId === neu.id && p.botId === myBotId,
-      );
-      if (wasIn) {
-        logMatchSummary(conn, neu.id);
-        console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
-        joinLobby(conn);
-      }
-    }
-  });
+function attachMatches(conn: DbConnection) {
+  if (myBotId === null) return;
+  for (const p of conn.db.matchParticipant.iter()) {
+    if (p.botId !== myBotId) continue;
+    const matchId = p.matchId;
+    const key = String(matchId);
+    if (finishedMatches.has(key) || activeMatchId === matchId) continue;
+    const m = conn.db.matchState.id.find(matchId);
+    if (m?.status.tag !== "Running") continue;
+    attachMatch(conn, matchId);
+    break;
+  }
 }
 
 function logMatchSummary(conn: DbConnection, matchId: bigint) {
@@ -363,49 +318,184 @@ function logMatchSummary(conn: DbConnection, matchId: bigint) {
   console.log("=".repeat(78) + "\n");
 }
 
+let joinPending = false;
 function joinLobby(conn: DbConnection) {
-  if (myBotId === null) return;
-  const inRunning = Array.from(conn.db.matchParticipant.iter()).some((p) => {
-    if (p.botId !== myBotId) return false;
-    const m = conn.db.matchState.id.find(p.matchId);
-    return m?.status.tag === "Running";
-  });
-  if (inRunning) return;
-  const openLobby = Array.from(conn.db.lobby.iter()).find(
-    (l) => l.status.tag === "Open",
+  if (myBotId === null || activeMatchId !== null || joinPending) return;
+
+  const alreadyIn = Array.from(conn.db.openLobbyMembers.iter()).some(
+    (lm) => lm.botId === myBotId,
   );
-  const alreadyIn =
-    openLobby !== undefined &&
-    Array.from(conn.db.lobbyMember.iter()).some(
-      (lm) => lm.lobbyId === openLobby.id && lm.botId === myBotId,
-    );
   if (alreadyIn) return;
+
+  joinPending = true;
   console.log(`[${BOT_NAME}] joining lobby`);
-  conn.reducers.joinLobby({}).catch(logFailure("joining the lobby"));
+  conn.reducers
+    .joinLobby({})
+    .then(() => {
+      console.log(`[${BOT_NAME}] joined lobby queue`);
+    })
+    .catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes("already in a running match")) {
+        console.warn(`[${BOT_NAME}] joining the lobby failed: ${msg}`);
+      }
+    })
+    .finally(() => {
+      joinPending = false;
+    });
 }
 
-function bootstrapActivity(conn: DbConnection) {
+function onConnect(conn: DbConnection, identity: Identity, token: string) {
+  myIdentity = identity;
+  saveToken(token);
+  console.log(`[${BOT_NAME}] connected as ${identity.toHexString()}`);
+
+  // 1. Subscribe to small account tables to resolve our bot identity
+  conn
+    .subscriptionBuilder()
+    .onError((ctx) => {
+      console.error(`[${BOT_NAME}] account subscription error: ${ctx.event}`);
+    })
+    .onApplied(() => {
+      myBotId = resolveMyBotId(conn);
+      if (myBotId === null) {
+        if (BOT_NONCE) {
+          console.log(`[${BOT_NAME}] claiming credential with nonce…`);
+          conn.reducers
+            .claimCredential({ code: BOT_NONCE })
+            .catch(logFailure("claiming the credential"));
+          setTimeout(() => {
+            myBotId = resolveMyBotId(conn);
+            if (myBotId === null) {
+              console.error(`[${BOT_NAME}] couldn't claim credential. Bad / expired nonce?`);
+              process.exit(1);
+            }
+            startBotOperations(conn);
+          }, 1000);
+          return;
+        } else {
+          console.error(
+            `[${BOT_NAME}] no BotCredential for this token. Set BOT_TOKEN or BOT_NONCE and re-run.`,
+          );
+          process.exit(1);
+        }
+      }
+
+      startBotOperations(conn);
+    })
+    .subscribe(["SELECT * FROM bot_credential", "SELECT * FROM bot"]);
+
+  // Table listeners for active match events
+  conn.db.matchParticipant.onInsert(() => {
+    setImmediate(() => attachMatches(conn));
+  });
+  conn.db.matchState.onInsert(() => {
+    setImmediate(() => attachMatches(conn));
+  });
+
+  conn.db.auction.onInsert((_ctx: EventContext, a) => {
+    if (a.matchId === activeMatchId && a.status.tag === "Open") {
+      tryBid(conn, a.id, a.matchId, a.letter);
+    }
+  });
+
+  conn.db.myRack.onInsert(() => {
+    if (activeMatchId !== null) tryPlayWord(conn, activeMatchId);
+  });
+  conn.db.myRack.onUpdate(() => {
+    if (activeMatchId !== null) tryPlayWord(conn, activeMatchId);
+  });
+
+  conn.db.auctionResult.onInsert((_ctx, r) => {
+    if (myBotId === null || r.matchId !== activeMatchId) return;
+    const winnerIdx = r.winnerBotId !== undefined && r.winnerBotId !== null ? Number(r.winnerBotId) : null;
+    benoitModel.eventBuffer.recordAuctionResult(winnerIdx, r.letter, Number(r.paid));
+    const winner =
+      r.winnerBotId !== undefined && r.winnerBotId !== null
+        ? String(r.winnerBotId)
+        : "no-bid";
+    console.log(
+      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid}`,
+    );
+  });
+
+  conn.db.wordPlay.onInsert((_ctx, wp) => {
+    if (wp.matchId !== activeMatchId) return;
+    benoitModel.eventBuffer.recordWordPlay(Number(wp.botId), wp.word, Number(wp.totalReward));
+  });
+
+  // When match ends, log summary and immediately re-queue
+  conn.db.matchState.onUpdate((_ctx, oldM, newM) => {
+    if (newM.id === activeMatchId && newM.status.tag === "Ended") {
+      finishedMatches.add(String(newM.id));
+      logMatchSummary(conn, newM.id);
+      benoitModel.eventBuffer.clear();
+      matchSub?.unsubscribe();
+      matchSub = null;
+      activeMatchId = null;
+      console.log(`[${BOT_NAME}] match ${newM.id} ended; rejoining lobby`);
+      setTimeout(() => joinLobby(conn), 250);
+    } else {
+      attachMatches(conn);
+    }
+  });
+}
+
+function startBotOperations(conn: DbConnection) {
+  const bot = conn.db.bot.id.find(myBotId!);
+  console.log(`[${BOT_NAME}] acting as bot '${bot?.name ?? "?"}' (id ${myBotId})`);
+
   if (TOURNAMENT_ID) {
     conn.reducers
       .registerForTournament({ tournamentId: BigInt(TOURNAMENT_ID) })
-      .then(() =>
-        console.log(`[${BOT_NAME}] registered for tournament ${TOURNAMENT_ID}`),
-      )
+      .then(() => console.log(`[${BOT_NAME}] registered for tournament ${TOURNAMENT_ID}`))
       .catch(logFailure(`registering for tournament ${TOURNAMENT_ID}`));
   }
-  joinLobby(conn);
-  for (const a of conn.db.auction.iter()) {
-    if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
-  }
-  tryPlayWord(conn);
+
+  // 2. Subscribe to scoped lobby and participant queries
+  conn
+    .subscriptionBuilder()
+    .onError((ctx) => {
+      console.warn(`[${BOT_NAME}] lobby subscription error: ${ctx.event}`);
+    })
+    .onApplied(() => {
+      console.log(`[${BOT_NAME}] lobby queue listener ready`);
+
+      // Check if already in a running match
+      attachMatches(conn);
+
+      // Initial join
+      joinLobby(conn);
+
+      // Heartbeat queue loop: ensures bot is always queuing when not in a match
+      const heartbeat = setInterval(() => {
+        attachMatches(conn);
+        if (activeMatchId === null) {
+          joinLobby(conn);
+        }
+      }, 3000);
+      heartbeat.unref();
+    })
+    .subscribe([
+      `SELECT match_state.* FROM match_state JOIN match_participant ON match_state.id = match_participant.match_id WHERE match_participant.bot_id = ${myBotId}`,
+      `SELECT * FROM match_participant WHERE bot_id = ${myBotId}`,
+      "SELECT * FROM open_lobbies",
+      "SELECT * FROM open_lobby_members",
+    ]);
 }
 
 function main() {
+  const savedToken = BOT_TOKEN ?? loadToken();
+  if (!savedToken && !BOT_NONCE) {
+    console.error("No bot token saved yet. Set BOT_TOKEN or run with BOT_NONCE.");
+    process.exitCode = 1;
+    return;
+  }
   console.log(`[${BOT_NAME}] connecting to ${DB_NAME} at ${HOST}`);
   DbConnection.builder()
     .withUri(HOST)
     .withDatabaseName(DB_NAME)
-    .withToken(BOT_TOKEN ?? loadToken())
+    .withToken(savedToken)
     .onConnect(onConnect)
     .onConnectError((_ctx: ErrorContext, err: Error) =>
       console.error("connect error:", err.message),

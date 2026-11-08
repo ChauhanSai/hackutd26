@@ -115,7 +115,7 @@ export function decideBid(ctx: BidContext): number {
   // Competitive market baseline:
   // In live lobbies, bids are typically 10-22 on regular tiles and 18-35 on premium tiles.
   // In Vickrey auctions you pay the 2nd highest bid, so a bid of 18 only costs ~12-14.
-  let marketBase = 10 + faceValue;
+  let marketBase = 12 + faceValue;
 
   if (ctx.myBalance >= 80) {
     marketBase = 12 + faceValue;
@@ -214,13 +214,13 @@ export function chooseWord(ctx: WordContext): string | null {
   }
 
   const roundNum = ctx.roundNum ?? 1;
-  const isLateGame = roundNum >= 55;
+  const isLateGame = roundNum >= 50;
   // Minimum word length requirement:
   // Vickrey auction letters cost ~10-25 coins each.
   // Playing <= 4 letter words yields only 1.0x-1.5x multipliers, losing money per cycle.
   // We hold letters unless we find a word of at least 5 letters (2.0x, 2.5x, 3.0x).
   // Late-game exception: if roundNum >= 55, allow >= 3 letters to avoid stranded tiles.
-  const minRequiredLen = isLateGame ? 3 : 5;
+  const minRequiredLen = isLateGame ? 2 : 4;
 
   // Find the highest scoring playable word satisfying minRequiredLen
   let bestWord: string | null = null;

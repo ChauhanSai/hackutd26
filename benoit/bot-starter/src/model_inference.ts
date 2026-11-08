@@ -105,9 +105,11 @@ export class BenoitModelSession {
       const currentDir = path.dirname(fileURLToPath(import.meta.url));
       const candidates = [
         path.join(process.cwd(), "benoit.onnx"),
-        path.join(process.cwd(), "scrabblebot", "bot-starter", "benoit.onnx"),
+        path.join(process.cwd(), "roger.onnx"),
         path.join(currentDir, "..", "benoit.onnx"),
+        path.join(currentDir, "..", "roger.onnx"),
         path.join(currentDir, "..", "..", "rust-client", "benoit.onnx"),
+        path.join(currentDir, "..", "..", "rust-client", "roger.onnx"),
       ];
 
       let modelPath = candidates.find((p) => fs.existsSync(p));

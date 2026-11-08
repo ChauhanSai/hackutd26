@@ -275,9 +275,17 @@ class ScrabbleBotEnv(gym.Env):
         return self.bag.pop(idx)
 
     def _update_best_word(self, player_idx: int) -> None:
-        self.best_words[player_idx] = self.dict.find_best_playable(
-            self.racks[player_idx], min_len=2
-        )
+        if player_idx == 0:
+            is_late_game = self.round_num >= 55 or len(self.bag) < 15
+            min_len = 3 if is_late_game else 5
+            best = self.dict.find_best_playable(self.racks[0], min_len=min_len)
+            if best[0] is None and int(self.racks[0].sum()) >= 11 and not is_late_game:
+                best = self.dict.find_best_playable(self.racks[0], min_len=4)
+            self.best_words[0] = best
+        else:
+            self.best_words[player_idx] = self.dict.find_best_playable(
+                self.racks[player_idx], min_len=2
+            )
 
     def _record_event(self, event_vector: np.ndarray) -> None:
         self.event_buffer.append(event_vector)
@@ -391,8 +399,10 @@ class ScrabbleBotEnv(gym.Env):
         bids = np.zeros(self.num_players, dtype=np.int32)
 
         # Agent 0 action
-        bid_frac = float(np.clip(action[0], 0.0, 1.0))
-        agent0_bid = int(round(bid_frac * self.balances[0]))
+        # Clamp bid fraction to at most 25% of balance (max 25 coins)
+        # to prevent Vickrey auction price-gouging and economic suicide
+        bid_frac = float(np.clip(action[0], 0.0, 1.0)) * 0.25
+        agent0_bid = min(25, int(round(bid_frac * self.balances[0])))
         bids[0] = agent0_bid
         agent0_play = float(action[1])
 
@@ -448,14 +458,15 @@ class ScrabbleBotEnv(gym.Env):
         # Agent 0 word play decision:
         word0, score0, len0, bonus0 = self.best_words[0]
         if word0 is not None:
-            is_late_game = self.round_num > 45 or len(self.bag) < 20
-            is_low_balance = self.balances[0] < 25
+            is_late_game = self.round_num >= 55 or len(self.bag) < 15
+            # Enforce hardcoded minimum word length safety net:
+            # Must be len0 >= 6, OR (len0 >= 5 and (bonus0 >= 4 or agent0_play > 0.45)), OR (is_late_game and len0 >= 3)
+            # This completely avoids playing 1.0x-1.5x words during early/mid game.
             should_play0 = (
-                agent0_play > 0.5 or
-                len0 >= 5 or
-                bonus0 >= 6 or
+                len0 >= 6 or
+                (len0 >= 5 and (bonus0 >= 4 or agent0_play > 0.45)) or
                 (is_late_game and len0 >= 3) or
-                (is_low_balance and len0 >= 3)
+                (int(self.racks[0].sum()) >= 11 and len0 >= 4)
             )
             if should_play0:
                 self._play_word(0, word0, score0)

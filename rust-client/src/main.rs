@@ -12,7 +12,7 @@ mod events;
 mod model;
 
 use dictionary::EnableDictionary;
-use events::{EventBuffer, EVENT_DIM, EVENT_HISTORY_LEN};
+use events::EventBuffer;
 use model::{BenoitInferenceEngine, PRIVATE_DIM};
 
 /// In-memory state of the active match
@@ -117,8 +117,14 @@ impl BenoitBot {
         let balance = state.balance;
         let rack = state.rack;
 
-        // Check best available word from current rack
-        let best_word_info = self.dictionary.find_best_playable(&rack, 2);
+        // Determine qualified word candidates enforcing minimum word length:
+        // Vickrey auction letters cost ~10-25 coins each.
+        // Playing words <= 4 letters yields only 1.0x-1.5x multiplier, causing severe economic starvation.
+        // Hardcoded safety net: force Benoit to hold letters unless finding a word of >= 5 or 6 letters.
+        // Late-game exception (round >= 55): allow min_len 3 so we don't finish with stranded unplayed tiles.
+        let is_late_game = round_num >= 55;
+        let min_word_len = if is_late_game { 3 } else { 5 };
+        let best_word_info = self.dictionary.find_best_playable(&rack, min_word_len);
 
         // Build private state and get event history
         let private_state = self.build_private_state(
@@ -137,25 +143,38 @@ impl BenoitBot {
         // Run neural network inference
         let (bid_fraction, play_threshold) = self.model.predict(&private_state, &event_history)?;
 
-        // Map continuous bid fraction into integer bid
-        let bid_amount = ((bid_fraction as f64) * (balance as f64)).round() as u64;
-        let final_bid = bid_amount.min(balance);
+        // Cap the Maximum Bid (Safety clamp):
+        // In Vickrey auctions, bidding 100% of balance gets price-gouged by opponents bidding 20-30.
+        // Clamp the model's bid fraction so Benoit never bids more than 25% of current bankroll,
+        // and cap the absolute bid to at most 25 coins.
+        let max_bid_fraction = 0.25f32;
+        let clamped_fraction = bid_fraction.clamp(0.0, max_bid_fraction);
+        let raw_bid = ((clamped_fraction as f64) * (balance as f64)).round() as u64;
+        let final_bid = raw_bid.min(25).min(balance);
         state.last_auction_bid = Some(final_bid);
 
         info!(
-            "[{}] Auction #{}: Letter '{}' | Bal: {} | NN Bid Frac: {:.2} -> Bid: {} | Play Thresh: {:.2}",
-            self.name, auction_id, letter, balance, bid_fraction, final_bid, play_threshold
+            "[{}] Auction #{}: Letter '{}' | Bal: {} | NN Bid Frac: {:.2} (Clamped: {:.2}) -> Bid: {} | Play Thresh: {:.2}",
+            self.name, auction_id, letter, balance, bid_fraction, clamped_fraction, final_bid, play_threshold
         );
 
-        // Word play decision:
-        let word_to_play = if play_threshold > 0.5 {
-            best_word_info.map(|(w, score, len, bonus)| {
+        // Word play decision with hardcoded minimum word length safety net:
+        let word_to_play = if let Some((ref w, score, len, bonus)) = best_word_info {
+            // Play if length >= 6 (massive 2.5x/3.0x multiplier), or len >= 5 with good bonus,
+            // or neural net play_threshold > 0.45 on a >= 5 letter word, or late game.
+            let should_play = len >= 6
+                || (len >= 5 && (bonus >= 5 || play_threshold > 0.45))
+                || (is_late_game && len >= 3);
+
+            if should_play {
                 info!(
-                    "[{}] Triggering word play: '{}' (Score: {}, Len: {}, Bonus: {})",
-                    self.name, w, score, len, bonus
+                    "[{}] Triggering word play: '{}' (Score: {}, Len: {}, Bonus: {}, LateGame: {})",
+                    self.name, w, score, len, bonus, is_late_game
                 );
-                w
-            })
+                Some(w.clone())
+            } else {
+                None
+            }
         } else {
             None
         };

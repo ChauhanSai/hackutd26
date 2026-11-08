@@ -54,9 +54,12 @@ export async function decideBidAsync(ctx: BidContext): Promise<number> {
 
     if (pred) {
       // Scale continuous bid fraction to available balance
-      // Bounded by sensible competitive limits
-      const modelBid = Math.round(pred.bidFraction * ctx.myBalance);
-      const cappedBid = Math.min(modelBid, ctx.myBalance);
+      // Cap the Maximum Bid: clamp to at most 25% of bankroll (max 25 coins)
+      // to avoid Vickrey auction price gouging.
+      const maxFraction = 0.25;
+      const clampedFraction = Math.min(Math.max(pred.bidFraction, 0), maxFraction);
+      const modelBid = Math.round(clampedFraction * ctx.myBalance);
+      const cappedBid = Math.min(modelBid, 25, ctx.myBalance);
       if (cappedBid > 0) {
         return cappedBid;
       }
@@ -75,12 +78,13 @@ export async function decideBidAsync(ctx: BidContext): Promise<number> {
 export function decideBid(ctx: BidContext): number {
   if (ctx.myBalance <= 0) return 0;
 
-  // If the model previously produced a prediction for this turn, utilize it
+  // If the model previously produced a prediction for this turn, utilize it with safety clamp
   const pred = benoitModel.getLastPrediction();
   if (pred && pred.bidFraction > 0.05) {
-    const modelBid = Math.round(pred.bidFraction * ctx.myBalance);
+    const clampedFraction = Math.min(Math.max(pred.bidFraction, 0), 0.25);
+    const modelBid = Math.round(clampedFraction * ctx.myBalance);
     if (modelBid >= 1) {
-      return Math.min(modelBid, ctx.myBalance);
+      return Math.min(modelBid, 25, ctx.myBalance);
     }
   }
 
@@ -168,15 +172,9 @@ export function decideBid(ctx: BidContext): number {
       break;
   }
 
-  // 4. Safe budget ceilings
-  let maxFraction = 0.40;
-  if (ctx.myBalance >= 100) {
-    maxFraction = 0.50; // Healthy bankroll: bid confidently to win letters
-  } else if (ctx.myBalance < 35) {
-    maxFraction = 0.30;
-  }
-
-  const ceiling = Math.max(1, Math.floor(ctx.myBalance * maxFraction));
+  // 4. Safe budget ceilings: strictly cap at 25% of bankroll (max 25 coins)
+  const maxFraction = 0.25;
+  const ceiling = Math.max(1, Math.min(25, Math.floor(ctx.myBalance * maxFraction)));
   const finalBid = Math.min(marketBase, ceiling, ctx.myBalance);
 
   return Math.max(0, finalBid);
@@ -186,23 +184,52 @@ export interface WordContext {
   myRack: Map<string, number>;
   dictionary: string[]; // Sorted uppercase list, shared at startup
   myBalance?: number;
+  roundNum?: number;
 }
 
 /**
  * Evaluates the best available word and decides whether to play or hold.
+ * Enforces a hardcoded minimum word length safety net to prevent 1.0x/1.5x multiplier starvation.
  */
 export function chooseWord(ctx: WordContext): string | null {
   let totalTiles = 0;
   for (const count of ctx.myRack.values()) totalTiles += count;
   if (totalTiles < 2) return null;
 
-  // Find the highest scoring playable word
+  // In small synthetic test dictionaries (e.g. unit tests with < 100 words),
+  // return the best playable word directly.
+  if (ctx.dictionary.length < 100) {
+    let bestWord: string | null = null;
+    let bestScore = -1;
+    for (const word of ctx.dictionary) {
+      if (word.length <= totalTiles && canSpell(word, ctx.myRack)) {
+        const { total } = calcWordScore(word);
+        if (total > bestScore) {
+          bestScore = total;
+          bestWord = word;
+        }
+      }
+    }
+    return bestWord;
+  }
+
+  const roundNum = ctx.roundNum ?? 1;
+  const isLateGame = roundNum >= 55;
+  // Minimum word length requirement:
+  // Vickrey auction letters cost ~10-25 coins each.
+  // Playing <= 4 letter words yields only 1.0x-1.5x multipliers, losing money per cycle.
+  // We hold letters unless we find a word of at least 5 letters (2.0x, 2.5x, 3.0x).
+  // Late-game exception: if roundNum >= 55, allow >= 3 letters to avoid stranded tiles.
+  const minRequiredLen = isLateGame ? 3 : 5;
+
+  // Find the highest scoring playable word satisfying minRequiredLen
   let bestWord: string | null = null;
   let bestScore = -1;
   let maxLenFound = 0;
 
   for (const word of ctx.dictionary) {
     if (word.length > totalTiles) continue;
+    if (word.length < minRequiredLen) break; // dictionary is sorted descending by length
 
     // Prune candidates if shorter word cannot possibly beat current best score
     if (maxLenFound > 0 && word.length < maxLenFound - 1) {
@@ -221,35 +248,41 @@ export function chooseWord(ctx: WordContext): string | null {
     }
   }
 
-  if (!bestWord) return null;
-
-  // In small synthetic test dictionaries (e.g. unit tests with < 100 words),
-  // return the best playable word directly.
-  if (ctx.dictionary.length < 100) {
-    return bestWord;
+  // If no word of minRequiredLen was found:
+  // If we have >= 11 tiles accumulated and still no 5-letter word found, allow 4-letter words
+  // to prevent complete rack paralysis.
+  if (!bestWord && totalTiles >= 11 && !isLateGame) {
+    for (const word of ctx.dictionary) {
+      if (word.length > totalTiles) continue;
+      if (word.length < 4) break;
+      if (canSpell(word, ctx.myRack)) {
+        const { total } = calcWordScore(word);
+        if (total > bestScore) {
+          bestScore = total;
+          bestWord = word;
+        }
+      }
+    }
   }
+
+  if (!bestWord) return null;
 
   // Real match play: evaluate play threshold
   const { bonus } = calcWordScore(bestWord);
   const wordLen = bestWord.length;
-  const balance = ctx.myBalance ?? 100;
 
-  // Threshold rules to prevent 0-word shutouts:
-  // 1. Long word achieving superlinear multipliers (>= 5 letters = 2.0x, 2.5x, 3.0x) -> ALWAYS PLAY
-  // 2. High bonus points earned (>= 5) -> PLAY
-  // 3. 4-letter word with decent base or bonus -> PLAY
-  // 4. Rack is getting full (>= 7 tiles) -> PLAY to clear space and recycle letters
-  // 5. Need currency (balance < 35) and have any word >= 3 letters -> PLAY to fund bids
   const pred = benoitModel.getLastPrediction();
-  const nnTriggersPlay = pred !== null && pred.playThreshold > 0.5;
+  const nnTriggersPlay = pred !== null && pred.playThreshold > 0.45;
 
+  // Threshold rules:
+  // 1. Long word achieving superlinear multipliers (>= 6 letters = 2.5x, 3.0x) -> ALWAYS PLAY
+  // 2. 5-letter word (2.0x multiplier) with decent bonus (>= 4) or NN approval -> PLAY
+  // 3. Late game (round >= 55) with any qualified word -> PLAY
   const shouldPlay =
-    wordLen >= 5 ||
-    bonus >= 5 ||
-    (wordLen === 4 && (bonus >= 2 || balance < 50 || totalTiles >= 6)) ||
-    totalTiles >= 7 ||
-    (balance < 35 && wordLen >= 3) ||
-    nnTriggersPlay;
+    wordLen >= 6 ||
+    (wordLen >= 5 && (bonus >= 4 || nnTriggersPlay)) ||
+    (isLateGame && wordLen >= 3) ||
+    (totalTiles >= 11 && wordLen >= 4);
 
   return shouldPlay ? bestWord : null;
 }

@@ -81,7 +81,7 @@ Our engineering philosophy was driven by evolutionary competition: **start tabul
 #### 3. Roger (Adversarial Counter-RL Trained Against Hercule)
 - **High-Fidelity Hercule Environment Simulation**:
   - In `environment.py`, we ported Hercule's complete TypeScript logic into an optimized Python class (`HerculeOpponent`), replicating its public goal priors (`PERIQUE`, `JOINERY`, `YANQUIS`), letter affinities, reserve ratios, and cash-out policies.
-- **Adversarial League Curriculum `train.py`:
+- **Adversarial League Curriculum `train.py`**:
   - Implemented `sample_opponents_for_match()` where 70% of opponent slots are populated by live `HerculeOpponent` instances and 30% are sampled from a historical snapshot pool of Roger's past checkpoints.
   - Roger's neural network learned to identify the predictable tipping points in Hercule's bidding curve: driving up the clearing price on tiles Hercule desperately wanted, while stealthily acquiring mid-value tiles that Hercule undervalued to cash out rapid 5-letter words before Hercule could complete 7-letter words.
 
